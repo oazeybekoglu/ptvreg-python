@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ptvreg-torch"                 # the pip name  (pip install ptvreg-torch)
+version = "0.1.0"
+description = "PyTorch port of pTVreg — parametric total-variation image registration"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "Apache-2.0"
+authors = [
+    { name = "Onur Ali Zeybekoglu", email = "onur-ali.zeybekoglu@it.uu.se" },
+]
+keywords = [
+    "image-registration", "deformable-registration",
+    "total-variation", "pytorch", "medical-imaging",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+]
+dependencies = [
+    "torch>=1.12",
+    "numpy>=1.21",
+]
+
+[project.optional-dependencies]
+# extras only the example scripts need — the core library stays lean
+examples = ["nibabel>=4.0", "scipy>=1.7", "matplotlib>=3.4"]
+dev = ["pytest>=7.0"]
+
+[project.urls]
+Homepage = "https://github.com/oalizeybekoglu/ptvreg-python"
+Issues   = "https://github.com/oalizeybekoglu/ptvreg-python/issues"
+
+# import name stays "ptv" (matches your existing `from ptv... import`),
+# distribution name is "ptvreg-torch". src-layout keeps them tidy.
+[tool.setuptools.packages.find]
+where = ["src"]
