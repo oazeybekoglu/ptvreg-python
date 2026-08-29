@@ -17,9 +17,11 @@ def disp_from_knots(
     nd = len(image_size)
     ksz = knots.shape[2:]
 
+
     covered_size = tuple(
         (ksz[d] - 1) * grid_spacing[d] + 1 for d in range(nd)
     )
+
 
     if nd == 2:
         mode = "bilinear"
@@ -29,8 +31,12 @@ def disp_from_knots(
         raise ValueError(f"nd must be 2 or 3, got {nd}")
 
     displacement = F.interpolate(
-        knots, size=covered_size, mode=mode, align_corners=True,
+        knots,
+        size=covered_size,
+        mode=mode,
+        align_corners=True,
     )
+
 
     if nd == 2:
         displacement = displacement[:, :, :image_size[0], :image_size[1]]

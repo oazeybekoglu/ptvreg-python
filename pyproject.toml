@@ -3,8 +3,8 @@ requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ptvreg-torch"                 # the pip name  (pip install ptvreg-torch)
-version = "0.1.0"
+name = "ptvreg-torch"
+version = "0.2.0"
 description = "PyTorch port of pTVreg — parametric total-variation image registration"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -27,15 +27,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# extras only the example scripts need — the core library stays lean
 examples = ["nibabel>=4.0", "scipy>=1.7", "matplotlib>=3.4"]
 dev = ["pytest>=7.0"]
 
 [project.urls]
-Homepage = "https://github.com/oalizeybekoglu/ptvreg-python"
-Issues   = "https://github.com/oalizeybekoglu/ptvreg-python/issues"
+Homepage = "https://github.com/oazeybekoglu/ptvreg-python"
+Issues   = "https://github.com/oazeybekoglu/ptvreg-python/issues"
 
-# import name stays "ptv" (matches your existing `from ptv... import`),
-# distribution name is "ptvreg-torch". src-layout keeps them tidy.
 [tool.setuptools.packages.find]
 where = ["src"]

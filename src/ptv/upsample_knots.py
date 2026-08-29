@@ -32,16 +32,21 @@ def upsample_knots(
         image_size_new[:nd], grid_spacing_new[:nd], spline_order
     )
 
+
     knots_init = _resize_like_matlab(knots, ksz_new, nd)
 
     if method == "direct":
         return knots_init
 
+
     with torch.no_grad():
         disp_old = disp_from_knots(
             knots, image_size_prev[:nd], grid_spacing_prev[:nd], spline_order
         )
+
+
         target_disp = _resize_like_matlab(disp_old, image_size_new[:nd], nd)
+
 
     knots_opt = knots_init.detach().clone().requires_grad_(True)
 
@@ -64,4 +69,12 @@ def upsample_knots(
             return loss
         optimizer.step(closure)
 
+
+    with torch.no_grad():
+        disp_pred = disp_from_knots(
+            knots_opt, image_size_new[:nd], grid_spacing_new[:nd], spline_order
+        )
+        mismatch = ((disp_pred - target_disp) ** 2).mean().sqrt().item()
+        print(f"    upsample_knots: refinement RMSE = {mismatch:.6f}")
+    
     return knots_opt.detach()

@@ -23,12 +23,14 @@ def _tricubic_warp_chunk(
     dtype = image.dtype
     chunk_d = d_end - d_start
 
+
     coords_d = torch.arange(d_start, d_end, device=device, dtype=dtype)
     coords_h = torch.arange(H, device=device, dtype=dtype)
     coords_w = torch.arange(W, device=device, dtype=dtype)
     grid_d, grid_h, grid_w = torch.meshgrid(
         coords_d, coords_h, coords_w, indexing='ij'
     )
+
 
     disp_d = displacement_pix[:, 0, d_start:d_end]
     disp_h = displacement_pix[:, 1, d_start:d_end]
@@ -50,7 +52,9 @@ def _tricubic_warp_chunk(
     floor_h_long = floor_h.long()
     floor_w_long = floor_w.long()
 
+
     image_flat = image.reshape(B, C, D * H * W)
+
 
     result = torch.zeros(B, C, chunk_d, H, W, device=device, dtype=dtype)
 
@@ -96,18 +100,24 @@ def warp_image(
     image: torch.Tensor,
     displacement_pix: torch.Tensor,
     interp_type: int = 0,
+    grid_dtype: torch.dtype = None,
 ) -> torch.Tensor:
     nd = image.dim() - 2
+
 
     if nd == 3 and interp_type == 1:
         return _tricubic_warp(image, displacement_pix, chunk_size=16)
 
+
     spatial_size = image.shape[2:]
     device = image.device
-    dtype = image.dtype
+    img_dtype = image.dtype
+
+
+    gdt = grid_dtype if grid_dtype is not None else img_dtype
 
     vectors = [
-        torch.linspace(-1.0, 1.0, s, device=device, dtype=dtype)
+        torch.linspace(-1.0, 1.0, s, device=device, dtype=gdt)
         for s in spatial_size
     ]
     grids = torch.meshgrid(*vectors, indexing="ij")
@@ -116,7 +126,8 @@ def warp_image(
     for d in range(nd):
         s = spatial_size[d]
         scale = 2.0 / (s - 1) if s > 1 else 0.0
-        disp_norm.append(displacement_pix[:, d] * scale)
+
+        disp_norm.append(displacement_pix[:, d].to(gdt) * scale)
 
     grid_components = []
     for gs_idx in range(nd):
@@ -134,9 +145,16 @@ def warp_image(
     else:
         mode = "bilinear"
 
+
+    if grid.dtype != img_dtype:
+        warped = F.grid_sample(
+            image.to(grid.dtype), grid, mode=mode,
+            padding_mode="border", align_corners=True,
+        )
+        return warped.to(img_dtype)
+
     warped = F.grid_sample(
         image, grid, mode=mode,
         padding_mode="border", align_corners=True,
     )
-
     return warped
