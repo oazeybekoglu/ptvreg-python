@@ -101,6 +101,42 @@ def _obj_scale(normalize, image_size, pix_res):
     return 1.0 / denom if denom > 0 else 1.0
 
 
+LCC_SIGMA_MIN_PIX_DEFAULT = 0.5
+
+
+def _lcc_sigma_pix(opts, pix_res_cur, nd):
+    """LCC window sigma in voxels of the current pyramid level.
+
+    With scale_metric_param=True (default) metric_param is a physical sigma
+    in mm, so the window measured in voxels shrinks at coarse levels. Below
+    ~0.5 voxel nearly all window weight sits on the centre voxel, the local
+    variance vanishes and the metric becomes epsilon noise at those levels.
+    lcc_sigma_min_pix (default 0.5) floors the sigma in voxels; it only
+    changes the coarsest levels. Pass 0 or None to disable.
+    """
+    mp = opts.get("metric_param", (7.0,) * nd)
+    if opts.get("scale_metric_param", True):
+        sigma_pix = tuple(mp[d] / pix_res_cur[d] for d in range(nd))
+    else:
+        pr0 = opts.get("pix_resolution", (1.0,) * nd)
+        sigma_pix = tuple(mp[d] / pr0[d] for d in range(nd))
+    smin = opts.get("lcc_sigma_min_pix", LCC_SIGMA_MIN_PIX_DEFAULT)
+    if smin:
+        sigma_pix = tuple(max(sp, float(smin)) for sp in sigma_pix)
+    return sigma_pix
+
+
+def _dense_jac_penalty(d, opts):
+    """jac_reg_dense * dense Jacobian folding penalty of one field (0.0 if off)."""
+    w = float(opts.get("jac_reg_dense", 0.0))
+    if w <= 0.0:
+        return 0.0
+    return w * jac_reg_regularization_dense(
+        d,
+        lower_bound=float(opts.get("jac_dense_lb", 0.5)),
+        upper_bound=float(opts.get("jac_dense_ub", 4.0)))
+
+
 def _build_data_loss(warped, fixed, opts, pix_res_cur, mask, compute_dtype=None):
     metric = opts["metric"]
     nd = warped.dim() - 2
@@ -112,18 +148,16 @@ def _build_data_loss(warped, fixed, opts, pix_res_cur, mask, compute_dtype=None)
         return sad_loss(warped, fixed, pix_res_cur, mask)
 
     elif metric == "lcc":
-        mp = opts.get("metric_param", (7.0,) * nd)
-        if opts.get("scale_metric_param", True):
-            sigma_pix = tuple(mp[d] / pix_res_cur[d] for d in range(nd))
-        else:
-            pr0 = opts.get("pix_resolution", (1.0,) * nd)
-            sigma_pix = tuple(mp[d] / pr0[d] for d in range(nd))
+        sigma_pix = _lcc_sigma_pix(opts, pix_res_cur, nd)
 
         eps = opts.get("deps", 1e-4)
         use_abs = opts.get("loc_cc_abs", False)
         return lcc_loss(warped, fixed, pix_res_cur, sigma_pix,
                         mask=mask, eps=eps, use_abs=use_abs,
-                        compute_dtype=compute_dtype)
+                        compute_dtype=compute_dtype,
+                        return_dtype=_resolve_loss_dtype(
+                            opts.get("lcc_return_dtype", None)),
+                        channel_weights=opts.get("channel_weights", None))
 
     elif metric == "mi":
 
@@ -143,7 +177,14 @@ def _build_data_loss(warped, fixed, opts, pix_res_cur, mask, compute_dtype=None)
         return mi_loss(warped, fixed, pix_res_cur,
                        n_bins=n_bins, intensity_range=intensity_range,
                        mask=mask, eps=eps,
-                       min_voxels_per_bin=min_vpb, verbose=mi_verbose)
+                       min_voxels_per_bin=min_vpb, verbose=mi_verbose,
+                       compute_dtype=compute_dtype,
+                       sum_dtype=_resolve_loss_dtype(
+                           opts.get("mi_sum_dtype", torch.float64)),
+                       return_dtype=_resolve_loss_dtype(
+                           opts.get("mi_return_dtype",
+                                    opts.get("lcc_return_dtype", None))),
+                       channel_weights=opts.get("channel_weights", None))
 
     else:
         raise NotImplementedError(f"Unsupported metric='{metric}'")
@@ -909,7 +950,9 @@ def register_pair_min(
         if verbose:
             print(f"Level {level_num}/{total_levels}: "
                   f"size={cur_imsz}, grid={cur_gs}, "
-                  f"pix_res={tuple(f'{p:.3f}' for p in cur_pr)}")
+                  f"pix_res={tuple(f'{p:.3f}' for p in cur_pr)}"
+                  + (f", lcc_sigma_vox={tuple(f'{v:.2f}' for v in _lcc_sigma_pix(opts, cur_pr, nd))}"
+                     if opts.get("metric") == "lcc" else ""))
 
         if knots is None:
             knots = init_knots(
@@ -1030,6 +1073,14 @@ def _optimize_level_symmetric(
     mask = _build_border_mask(cur_imsz, border_mask, device, dtype)
     tv_spacing = tuple(cur_pr[d] * cur_gs[d] for d in range(nd))
 
+
+    # Same loss dtype, objective normalisation, tolerances and warp-grid
+    # precision as the one-directional solver (_optimize_level).
+    _cdt, _normalize, _tol_grad, _tol_change = _loss_settings(opts, dtype)
+    _oscale = _obj_scale(_normalize, cur_imsz, cur_pr)
+    _wgdt = _resolve_loss_dtype(opts.get("warp_compute_dtype", torch.float64))
+    _icdt = _cdt if _cdt is not None else dtype
+
     def _forward_losses(knots_fm_, knots_mf_):
 
         kp_fm = params_phys_to_pix(knots_fm_, cur_pr, spline_order)
@@ -1038,19 +1089,28 @@ def _optimize_level_symmetric(
         d_mf = disp_from_knots(kp_mf, cur_imsz, cur_gs, spline_order)
 
 
-        warped_M = warp_image(vol_mov, d_fm, interp_type)
-        warped_F = warp_image(vol_fix, d_mf, interp_type)
-        data_fwd = _build_data_loss(warped_M, vol_fix, opts, cur_pr, mask)
-        data_bwd = _build_data_loss(warped_F, vol_mov, opts, cur_pr, mask)
+        warped_M = warp_image(vol_mov, d_fm, interp_type, grid_dtype=_wgdt)
+        warped_F = warp_image(vol_fix, d_mf, interp_type, grid_dtype=_wgdt)
+        data_fwd = _build_data_loss(warped_M, vol_fix, opts, cur_pr, mask,
+                                    compute_dtype=_cdt)
+        data_bwd = _build_data_loss(warped_F, vol_mov, opts, cur_pr, mask,
+                                    compute_dtype=_cdt)
 
 
         reg_fwd = _per_direction_reg(knots_fm_, opts, tv_spacing, csqrt, isoTV)
         reg_bwd = _per_direction_reg(knots_mf_, opts, tv_spacing, csqrt, isoTV)
+        # Dense Jacobian penalty needs the voxel-level field, so it is added
+        # here rather than in _per_direction_reg (it used to be ignored
+        # whenever ic_weight > 0).
+        reg_fwd = reg_fwd + _dense_jac_penalty(d_fm, opts)
+        reg_bwd = reg_bwd + _dense_jac_penalty(d_mf, opts)
 
 
-        ic = inverse_consistency_loss(d_fm, d_mf, cur_pr, mask=mask)
+        ic = inverse_consistency_loss(d_fm.to(_icdt), d_mf.to(_icdt),
+                                      cur_pr, mask=mask)
 
-        total = data_fwd + data_bwd + reg_fwd + reg_bwd + ic_weight * ic
+        total = (data_fwd + data_bwd + reg_fwd + reg_bwd
+                 + ic_weight * ic) * _oscale
         return total, {
             "data_fwd": data_fwd, "data_bwd": data_bwd,
             "reg_fwd": reg_fwd, "reg_bwd": reg_bwd,
@@ -1083,8 +1143,8 @@ def _optimize_level_symmetric(
             history_size=hist_size,
             line_search_fn="strong_wolfe",
             lr=1.0,
-            tolerance_grad=1e-8,
-            tolerance_change=1e-9,
+            tolerance_grad=_tol_grad * _oscale,
+            tolerance_change=_tol_change * _oscale,
         )
 
         def closure():
@@ -1145,12 +1205,14 @@ def _optimize_level_symmetric(
         total, comp = _forward_losses(knots_fm, knots_mf)
 
     info = LevelInfo(
-        data_loss=comp["data_fwd"].item(),
-        data_loss_inv=comp["data_bwd"].item(),
-        reg_loss=comp["reg_fwd"].item(),
-        reg_loss_inv=comp["reg_bwd"].item(),
-        ic_loss=comp["ic"].item(),
-        total_loss=total.item(),
+        data_loss=float(comp["data_fwd"]),
+        data_loss_inv=float(comp["data_bwd"]),
+        reg_loss=float(comp["reg_fwd"]),
+        reg_loss_inv=float(comp["reg_bwd"]),
+        ic_loss=float(comp["ic"]),
+        total_loss=total.item() / _oscale,
+        total_loss_norm=total.item(),
+        oscale=_oscale,
         n_iters=n_iters,
     )
 
@@ -1258,7 +1320,9 @@ def register_pair_symmetric(
         if verbose:
             print(f"Level {level_num}/{total_levels}: "
                   f"size={cur_imsz}, grid={cur_gs}, "
-                  f"pix_res={tuple(f'{p:.3f}' for p in cur_pr)}")
+                  f"pix_res={tuple(f'{p:.3f}' for p in cur_pr)}"
+                  + (f", lcc_sigma_vox={tuple(f'{v:.2f}' for v in _lcc_sigma_pix(opts, cur_pr, nd))}"
+                     if opts.get("metric") == "lcc" else ""))
 
         if knots_fm is None:
             knots_fm = init_knots(cur_imsz, cur_gs, nd, 1, spline_order,
@@ -1361,6 +1425,10 @@ def _optimize_level_admm_symmetric(
 ):
     mask = _build_border_mask(cur_imsz, border_mask_px, device, dtype)
     tv_spacing = tuple(cur_pr[d] * cur_gs[d] for d in range(nd))
+    _cdt, _normalize, _tol_grad, _tol_change = _loss_settings(opts, dtype)
+    _oscale = _obj_scale(_normalize, cur_imsz, cur_pr)
+    _wgdt = _resolve_loss_dtype(opts.get("warp_compute_dtype", torch.float64))
+    _icdt = _cdt if _cdt is not None else dtype
 
     lam = isoTV
     eta = 1.0
@@ -1407,8 +1475,8 @@ def _optimize_level_admm_symmetric(
         history_size=5,
         line_search_fn="strong_wolfe",
         lr=1.0,
-        tolerance_grad=1e-8,
-        tolerance_change=1e-9,
+        tolerance_grad=_tol_grad * _oscale,
+        tolerance_change=_tol_change * _oscale,
     )
 
     total_func_evals = 0
@@ -1446,10 +1514,12 @@ def _optimize_level_admm_symmetric(
             d_fm = disp_from_knots(kp_fm, cur_imsz, cur_gs, spline_order)
             d_mf = disp_from_knots(kp_mf, cur_imsz, cur_gs, spline_order)
 
-            warped_M = warp_image(vol_mov, d_fm, interp_type)
-            warped_F = warp_image(vol_fix, d_mf, interp_type)
-            data_fwd = _build_data_loss(warped_M, vol_fix, opts, cur_pr, mask)
-            data_bwd = _build_data_loss(warped_F, vol_mov, opts, cur_pr, mask)
+            warped_M = warp_image(vol_mov, d_fm, interp_type, grid_dtype=_wgdt)
+            warped_F = warp_image(vol_fix, d_mf, interp_type, grid_dtype=_wgdt)
+            data_fwd = _build_data_loss(warped_M, vol_fix, opts, cur_pr, mask,
+                                        compute_dtype=_cdt)
+            data_bwd = _build_data_loss(warped_F, vol_mov, opts, cur_pr, mask,
+                                        compute_dtype=_cdt)
 
             Dk_fm_cur = _compute_D_knots(
                 knots_fm_opt, tv_spacing, nd, differentiable=True)
@@ -1457,11 +1527,14 @@ def _optimize_level_admm_symmetric(
                 knots_mf_opt, tv_spacing, nd, differentiable=True)
             penalty_fm = (cur_rho_fm / 2.0) * ((Dk_fm_cur - target_fm) ** 2).sum()
             penalty_mf = (cur_rho_mf / 2.0) * ((Dk_mf_cur - target_mf) ** 2).sum()
+            penalty_fm = penalty_fm + _dense_jac_penalty(d_fm, opts)
+            penalty_mf = penalty_mf + _dense_jac_penalty(d_mf, opts)
 
             total = data_fwd + data_bwd + penalty_fm + penalty_mf
             if ic_weight > 0:
                 total = total + ic_weight * inverse_consistency_loss(
-                    d_fm, d_mf, cur_pr, mask=mask)
+                    d_fm.to(_icdt), d_mf.to(_icdt), cur_pr, mask=mask)
+            total = total * _oscale
 
             total.backward()
             func_evals[0] += 1
@@ -1542,10 +1615,12 @@ def _optimize_level_admm_symmetric(
             kp_m_mf = params_phys_to_pix(knots_mf_opt, cur_pr, spline_order)
             d_m_fm = disp_from_knots(kp_m_fm, cur_imsz, cur_gs, spline_order)
             d_m_mf = disp_from_knots(kp_m_mf, cur_imsz, cur_gs, spline_order)
-            wM = warp_image(vol_mov, d_m_fm, interp_type)
-            wF = warp_image(vol_fix, d_m_mf, interp_type)
-            data_fwd_m = _build_data_loss(wM, vol_fix, opts, cur_pr, mask).item()
-            data_bwd_m = _build_data_loss(wF, vol_mov, opts, cur_pr, mask).item()
+            wM = warp_image(vol_mov, d_m_fm, interp_type, grid_dtype=_wgdt)
+            wF = warp_image(vol_fix, d_m_mf, interp_type, grid_dtype=_wgdt)
+            data_fwd_m = _build_data_loss(wM, vol_fix, opts, cur_pr, mask,
+                                          compute_dtype=_cdt).item()
+            data_bwd_m = _build_data_loss(wF, vol_mov, opts, cur_pr, mask,
+                                          compute_dtype=_cdt).item()
 
             penalty_fm_m = (rho_fm / 2.0) * (r_fm ** 2).sum().item()
             penalty_mf_m = (rho_mf / 2.0) * (r_mf ** 2).sum().item()
@@ -1557,8 +1632,12 @@ def _optimize_level_admm_symmetric(
             z_sparse_fm = (z_norms_fm < 1e-10).float().mean().item()
             z_sparse_mf = (z_norms_mf < 1e-10).float().mean().item()
 
-            ic_m = inverse_consistency_loss(d_m_fm, d_m_mf, cur_pr, mask=mask).item()
-            total_m = data_fwd_m + data_bwd_m + tv_fm_m + tv_mf_m + ic_weight * ic_m
+            ic_m = inverse_consistency_loss(d_m_fm.to(_icdt), d_m_mf.to(_icdt),
+                                            cur_pr, mask=mask).item()
+            jac_m = (float(_dense_jac_penalty(d_m_fm, opts))
+                     + float(_dense_jac_penalty(d_m_mf, opts)))
+            total_m = (data_fwd_m + data_bwd_m + tv_fm_m + tv_mf_m + jac_m
+                       + ic_weight * ic_m)
 
         admm_hist['data_fwd'].append(data_fwd_m)
         admm_hist['data_bwd'].append(data_bwd_m)
@@ -1599,16 +1678,21 @@ def _optimize_level_admm_symmetric(
         kp_mf = params_phys_to_pix(knots_mf_opt, cur_pr, spline_order)
         d_fm = disp_from_knots(kp_fm, cur_imsz, cur_gs, spline_order)
         d_mf = disp_from_knots(kp_mf, cur_imsz, cur_gs, spline_order)
-        wM = warp_image(vol_mov, d_fm, interp_type)
-        wF = warp_image(vol_fix, d_mf, interp_type)
-        final_data_fwd = _build_data_loss(wM, vol_fix, opts, cur_pr, mask).item()
-        final_data_bwd = _build_data_loss(wF, vol_mov, opts, cur_pr, mask).item()
+        wM = warp_image(vol_mov, d_fm, interp_type, grid_dtype=_wgdt)
+        wF = warp_image(vol_fix, d_mf, interp_type, grid_dtype=_wgdt)
+        final_data_fwd = _build_data_loss(wM, vol_fix, opts, cur_pr, mask,
+                                          compute_dtype=_cdt).item()
+        final_data_bwd = _build_data_loss(wF, vol_mov, opts, cur_pr, mask,
+                                          compute_dtype=_cdt).item()
 
         z_norms_fm = torch.sqrt((Z_fm ** 2).sum(dim=1))
         z_norms_mf = torch.sqrt((Z_mf ** 2).sum(dim=1))
         final_reg_fwd = (lam * eta * z_norms_fm.sum() / knots_fm_opt.shape[0]).item()
         final_reg_bwd = (lam * eta * z_norms_mf.sum() / knots_mf_opt.shape[0]).item()
-        final_ic = inverse_consistency_loss(d_fm, d_mf, cur_pr, mask=mask).item()
+        final_reg_fwd += float(_dense_jac_penalty(d_fm, opts))
+        final_reg_bwd += float(_dense_jac_penalty(d_mf, opts))
+        final_ic = inverse_consistency_loss(d_fm.to(_icdt), d_mf.to(_icdt),
+                                            cur_pr, mask=mask).item()
 
     knots_fm_out = knots_fm_opt.detach().clone().requires_grad_(True)
     knots_mf_out = knots_mf_opt.detach().clone().requires_grad_(True)
@@ -1622,6 +1706,10 @@ def _optimize_level_admm_symmetric(
         total_loss=(final_data_fwd + final_data_bwd
                     + final_reg_fwd + final_reg_bwd
                     + ic_weight * final_ic),
+        total_loss_norm=(final_data_fwd + final_data_bwd
+                         + final_reg_fwd + final_reg_bwd
+                         + ic_weight * final_ic) * _oscale,
+        oscale=_oscale,
         n_iters=total_func_evals,
         admm_history=admm_hist,
     )

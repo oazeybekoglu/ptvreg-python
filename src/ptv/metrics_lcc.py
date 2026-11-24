@@ -1,6 +1,8 @@
 import torch
 import math
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Sequence
+
+from .channel_weights import normalize_channel_weights
 
 
 def _build_gaussian_fft(
@@ -72,40 +74,66 @@ def lcc_loss(
     eps: float = 1e-4,
     use_abs: bool = False,
     compute_dtype: Optional[torch.dtype] = None,
+    sum_dtype: Optional[torch.dtype] = torch.float64,
+    return_dtype: Optional[torch.dtype] = None,
+    channel_weights: Optional[Sequence[float]] = None,
 ) -> torch.Tensor:
+    """Negated local (Gaussian-window) correlation coefficient, summed over voxels.
+
+    Multi-channel images (B, C, *spatial) are compared channel by channel
+    (channel c of ``warped`` against channel c of ``fixed``) and the per-channel
+    losses are combined with ``channel_weights`` (normalised to sum to 1;
+    None = plain average over channels).
+
+    sum_dtype : dtype of the voxel sum (float64 by default, so the reduction is
+        exact even when compute_dtype is float32). None -> compute dtype.
+    return_dtype : dtype of the returned scalar. None -> input dtype.
+    """
     nd = warped.dim() - 2
     spatial_size = warped.shape[2:]
     device = warped.device
     dtype = warped.dtype
     n_channels = warped.shape[1]
+    if fixed.shape[1] != n_channels:
+        raise ValueError(
+            f"channel mismatch: warped has {n_channels}, fixed has "
+            f"{fixed.shape[1]} channel(s)")
+    weights = normalize_channel_weights(channel_weights, n_channels)
 
 
     cdt = compute_dtype if compute_dtype is not None else dtype
+    sdt = sum_dtype if sum_dtype is not None else cdt
 
     pix_vol = 1.0
     for p in pix_resolution:
         pix_vol *= p
 
 
-    g_fft = _build_gaussian_fft(spatial_size, sigma_pix[:nd], device, dtype)
+    # Cast to the compute dtype BEFORE forming I*I, J*J, I*J and build the
+    # Gaussian kernel in it too. var = E[I^2] - E[I]^2 cancels in flat
+    # regions, so float32 products or kernel weights give ~1e-4 relative
+    # error in the loss even when compute_dtype is float64.
+    if cdt != dtype:
+        warped = warped.to(cdt)
+        fixed = fixed.to(cdt)
 
-    total_loss = torch.zeros((), device=device, dtype=cdt)
+    g_fft = _build_gaussian_fft(spatial_size, sigma_pix[:nd], device, cdt)
+
+    total_loss = torch.zeros((), device=device, dtype=sdt)
 
     for ch in range(n_channels):
+        w_ch = weights[ch]
+        if w_ch == 0.0:
+            continue
         I = warped[:, ch:ch+1]
         J = fixed[:, ch:ch+1]
 
 
-        _sdt = cdt if cdt != dtype else None
-        gI  = _gauss_smooth(I, g_fft, spatial_size, smooth_dtype=_sdt)
-        gJ  = _gauss_smooth(J, g_fft, spatial_size, smooth_dtype=_sdt)
-        gII = _gauss_smooth(I * I, g_fft, spatial_size, smooth_dtype=_sdt)
-        gJJ = _gauss_smooth(J * J, g_fft, spatial_size, smooth_dtype=_sdt)
-        gIJ = _gauss_smooth(I * J, g_fft, spatial_size, smooth_dtype=_sdt)
-
-
-        gI  = gI.to(cdt);  gJ  = gJ.to(cdt)
-        gII = gII.to(cdt); gJJ = gJJ.to(cdt); gIJ = gIJ.to(cdt)
+        gI  = _gauss_smooth(I, g_fft, spatial_size)
+        gJ  = _gauss_smooth(J, g_fft, spatial_size)
+        gII = _gauss_smooth(I * I, g_fft, spatial_size)
+        gJJ = _gauss_smooth(J * J, g_fft, spatial_size)
+        gIJ = _gauss_smooth(I * J, g_fft, spatial_size)
 
 
         var_I  = (gII - gI * gI).clamp(min=0.0)
@@ -123,9 +151,7 @@ def lcc_loss(
             cc = cc * mask.to(cdt)
 
 
-        total_loss = total_loss - pix_vol * cc.sum()
-
-    total_loss = total_loss / n_channels
+        total_loss = total_loss - (w_ch * pix_vol) * cc.to(sdt).sum()
 
 
-    return total_loss.to(dtype)
+    return total_loss.to(return_dtype if return_dtype is not None else dtype)

@@ -1,6 +1,9 @@
+import math
 import torch
 import torch.nn.functional as F
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Sequence
+
+from .channel_weights import normalize_channel_weights
 
 
 def _bspline3(x: torch.Tensor) -> torch.Tensor:
@@ -13,25 +16,20 @@ def _bspline3(x: torch.Tensor) -> torch.Tensor:
     return torch.where(ax < 2.0, val, torch.zeros_like(val))
 
 
-def mi_loss(
+def _mi_single_channel(
     warped: torch.Tensor,
     fixed: torch.Tensor,
-    pix_resolution: Tuple[float, ...],
-    n_bins: int = 32,
-    intensity_range: Tuple[float, float] = (0.0, 1.0),
-    mask: Optional[torch.Tensor] = None,
-    eps: float = 1e-10,
-    min_voxels_per_bin: float = 50.0,
-    verbose: bool = False,
+    pix_vol: float,
+    n_bins: int,
+    intensity_range: Tuple[float, float],
+    mask: Optional[torch.Tensor],
+    eps: float,
+    min_voxels_per_bin: float,
+    verbose: bool,
+    cdt: torch.dtype,
+    sdt: torch.dtype,
 ) -> torch.Tensor:
-    if warped.shape != fixed.shape:
-        raise ValueError(
-            f"shape mismatch: warped {tuple(warped.shape)} vs "
-            f"fixed {tuple(fixed.shape)}"
-        )
-    if n_bins < 4:
-        raise ValueError(f"n_bins must be >= 4 (got {n_bins})")
-
+    """Negated Mattes MI of one channel pair, in the sum dtype ``sdt``."""
     device = warped.device
     dtype = warped.dtype
 
@@ -49,12 +47,15 @@ def mi_loss(
     n_active = f_flat.numel()
     if n_active == 0:
 
-        return (warped * 0.0).sum()
+        return (warped * 0.0).sum().to(sdt)
+
+    if cdt != dtype:
+        f_flat = f_flat.to(cdt)
+        w_flat = w_flat.to(cdt)
 
 
     if min_voxels_per_bin and min_voxels_per_bin > 0:
-        import math as _math
-        cap = int(_math.floor(_math.sqrt(n_active / float(min_voxels_per_bin))))
+        cap = int(math.floor(math.sqrt(n_active / float(min_voxels_per_bin))))
         eff_bins = max(6, min(int(n_bins), cap))
     else:
         eff_bins = int(n_bins)
@@ -83,19 +84,22 @@ def mi_loss(
 
     i_F = torch.floor(b_F).long()
     i_M = torch.floor(b_M).long()
-    df  = b_F - i_F.to(dtype)
-    dm  = b_M - i_M.to(dtype)
+    df  = b_F - i_F.to(cdt)
+    dm  = b_M - i_M.to(cdt)
 
 
     offsets = torch.tensor([-1, 0, 1, 2], device=device)
-    offsets_f = offsets.to(dtype)
+    offsets_f = offsets.to(cdt)
 
 
     w_F_all = _bspline3(df.unsqueeze(-1) - offsets_f.unsqueeze(0))
     w_M_all = _bspline3(dm.unsqueeze(-1) - offsets_f.unsqueeze(0))
 
 
-    joint_flat = torch.zeros(n_bins * n_bins, dtype=dtype, device=device)
+    # Joint histogram accumulated in sdt (float64 by default): millions of
+    # voxels summed into <= n_bins^2 cells in float32 bias the MI value and
+    # its gradient at full resolution.
+    joint_flat = torch.zeros(n_bins * n_bins, dtype=sdt, device=device)
 
 
     for k in range(4):
@@ -107,7 +111,7 @@ def mi_loss(
 
             w_kl = w_F_all[:, k] * w_M_all[:, l]
 
-            joint_flat = joint_flat.scatter_add(0, flat_idx, w_kl)
+            joint_flat = joint_flat.scatter_add(0, flat_idx, w_kl.to(sdt))
 
 
     joint = joint_flat.view(n_bins, n_bins) / float(n_active)
@@ -122,9 +126,70 @@ def mi_loss(
     H_FM = -(joint * torch.log(joint + eps)).sum()
     mi   = H_F + H_M - H_FM
 
+    return -mi * pix_vol * n_active
+
+
+def mi_loss(
+    warped: torch.Tensor,
+    fixed: torch.Tensor,
+    pix_resolution: Tuple[float, ...],
+    n_bins: int = 32,
+    intensity_range: Tuple[float, float] = (0.0, 1.0),
+    mask: Optional[torch.Tensor] = None,
+    eps: float = 1e-10,
+    min_voxels_per_bin: float = 50.0,
+    verbose: bool = False,
+    compute_dtype: Optional[torch.dtype] = None,
+    sum_dtype: Optional[torch.dtype] = torch.float64,
+    return_dtype: Optional[torch.dtype] = None,
+    channel_weights: Optional[Sequence[float]] = None,
+) -> torch.Tensor:
+    """Negated Mattes mutual information (B-spline Parzen windows).
+
+    Multi-channel images (B, C, *spatial) are compared channel by channel:
+    one joint histogram per channel pair (channel c of ``warped`` against
+    channel c of ``fixed``), and the per-channel losses are combined with
+    ``channel_weights`` (normalised to sum to 1; None = plain average).
+    Every channel is binned over the same ``intensity_range``, so scale each
+    channel to that range first. One channel gives the usual single MI.
+
+    compute_dtype : dtype for the bin positions and Parzen weights.
+        None -> input dtype.
+    sum_dtype : dtype of the joint histogram and entropies (float64 by
+        default). None -> compute dtype.
+    return_dtype : dtype of the returned scalar. None -> input dtype.
+    """
+    if warped.shape != fixed.shape:
+        raise ValueError(
+            f"shape mismatch: warped {tuple(warped.shape)} vs "
+            f"fixed {tuple(fixed.shape)}"
+        )
+    if n_bins < 4:
+        raise ValueError(f"n_bins must be >= 4 (got {n_bins})")
+
+    dtype = warped.dtype
+    cdt = compute_dtype if compute_dtype is not None else dtype
+    sdt = sum_dtype if sum_dtype is not None else cdt
+    rdt = return_dtype if return_dtype is not None else dtype
 
     pix_vol = 1.0
     for p in pix_resolution:
         pix_vol *= float(p)
 
-    return -mi * pix_vol * n_active
+    n_channels = warped.shape[1]
+    weights = normalize_channel_weights(channel_weights, n_channels)
+
+    total = torch.zeros((), device=warped.device, dtype=sdt)
+    first = True
+    for ch in range(n_channels):
+        w_ch = weights[ch]
+        if w_ch == 0.0:
+            continue
+        mi_ch = _mi_single_channel(
+            warped[:, ch:ch+1], fixed[:, ch:ch+1], pix_vol,
+            n_bins, intensity_range, mask, eps, min_voxels_per_bin,
+            verbose and first, cdt, sdt)
+        total = total + w_ch * mi_ch
+        first = False
+
+    return total.to(rdt)
